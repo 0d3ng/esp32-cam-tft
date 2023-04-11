@@ -116,6 +116,26 @@ static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, in
   }
 }
 
+static inline mtmn_config_t app_mtmn_config()
+{
+  mtmn_config_t mtmn_config = {0};
+  mtmn_config.type = FAST;
+  mtmn_config.min_face = 60; // 80 default
+  mtmn_config.pyramid = 0.707;
+  mtmn_config.pyramid_times = 4;
+  mtmn_config.p_threshold.score = 0.6;
+  mtmn_config.p_threshold.nms = 0.7;
+  mtmn_config.p_threshold.candidate_number = 20;
+  mtmn_config.r_threshold.score = 0.7;
+  mtmn_config.r_threshold.nms = 0.7;
+  mtmn_config.r_threshold.candidate_number = 10;
+  mtmn_config.o_threshold.score = 0.7;
+  mtmn_config.o_threshold.nms = 0.7;
+  mtmn_config.o_threshold.candidate_number = 1;
+  return mtmn_config;
+}
+mtmn_config_t mtmn_config = app_mtmn_config();
+
 void setup()
 {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
@@ -182,7 +202,6 @@ void setup()
 
 void loop()
 {
-  // dl_matrix3du_t *image_matrix = NULL;
   camera_fb_t *fb = NULL;
   fb = esp_camera_fb_get();
   if (!fb)
@@ -191,42 +210,22 @@ void loop()
     return;
   }
 
+  // dl_matrix3du_t *image_matrix = NULL;
   // image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3); // 分配內部記憶體
-  // if (!image_matrix)
+  // fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item);
+  // box_array_t *net_boxes = NULL;
+  // net_boxes = face_detect(image_matrix, &mtmn_config);
+
+  // if (net_boxes)
   // {
-  //   Serial.println("dl_matrix3du_alloc failed");
-  // }
-  // else
-  // {
-  //   static mtmn_config_t mtmn_config = {0};
-  //   mtmn_config.type = FAST;
-  //   mtmn_config.min_face = 80;
-  //   mtmn_config.pyramid = 0.707;
-  //   mtmn_config.pyramid_times = 4;
-  //   mtmn_config.p_threshold.score = 0.6;
-  //   mtmn_config.p_threshold.nms = 0.7;
-  //   mtmn_config.p_threshold.candidate_number = 20;
-  //   mtmn_config.r_threshold.score = 0.7;
-  //   mtmn_config.r_threshold.nms = 0.7;
-  //   mtmn_config.r_threshold.candidate_number = 10;
-  //   mtmn_config.o_threshold.score = 0.7;
-  //   mtmn_config.o_threshold.nms = 0.7;
-  //   mtmn_config.o_threshold.candidate_number = 1;
+  //   Serial.println("Face detected");
+  //   draw_face_boxes(image_matrix, net_boxes, 0); // 繪製人臉方框
 
-  //   fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item);     // 影像格式轉換RGB格式
-  //   box_array_t *net_boxes = face_detect(image_matrix, &mtmn_config); // 偵測人臉取得臉框數據
-
-  //   if (net_boxes)
-  //   {
-  //     Serial.println("Face detected");
-  //     draw_face_boxes(image_matrix, net_boxes, 0); // 繪製人臉方框
-
-  //     dl_lib_free(net_boxes->score);
-  //     dl_lib_free(net_boxes->box);
-  //     dl_lib_free(net_boxes->landmark);
-  //     dl_lib_free(net_boxes);
-  //     net_boxes = NULL;
-  //   }
+  //   dl_lib_free(net_boxes->score);
+  //   dl_lib_free(net_boxes->box);
+  //   dl_lib_free(net_boxes->landmark);
+  //   dl_lib_free(net_boxes);
+  //   net_boxes = NULL;
   // }
 
   fex.drawJpg((const uint8_t *)fb->buf, fb->len, 0, 6);
