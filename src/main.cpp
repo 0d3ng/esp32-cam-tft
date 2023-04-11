@@ -42,6 +42,11 @@ Add the settings at the end of the file.  C:\Users\..\Documents\Arduino\librarie
 #include <TJpg_Decoder.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
+
+#include "base64.h"
+#include "PubSubClient.h"
+#include <WiFi.h>
+#include "time.h"
 #define GFXFF 1
 #define FSB9 &FreeSerifBold9pt7b
 
@@ -75,7 +80,83 @@ TFT_eSPI tft = TFT_eSPI();
 #define FACE_COLOR_CYAN (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
-uint16_t dmaBuffer[16 * 16];
+// const char *ssid = "Uw415 Ph0n3";
+// const char *password = "0dengbr0";
+
+const char *ssid = "JTI-POLINEMA";
+const char *password = "jtifast!";
+
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 3600 * 6;
+const int daylightOffset_sec = 3600;
+
+struct tm timeinfo;
+String currentTime = "";
+String MAC;
+WiFiClient espClient;
+PubSubClient client(espClient);
+camera_fb_t *cropped = (camera_fb_t *)malloc(sizeof(camera_fb_t));
+
+const char *brokerUser = NULL;
+const char *brokerPass = NULL;
+const char *brokerHost = "192.168.74.14";
+
+unsigned long previousMillis = 0; // Stores last time images was published
+const long interval = 1000 * 10;  // Interval at which to publish images
+const int IMAGE_WIDTH = 100;      // image crop
+
+void reconnect()
+{
+  while (!client.connected())
+  {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect(MAC.c_str(), brokerUser, brokerPass))
+    {
+      Serial.println("connected");
+    }
+    else
+    {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+
+      delay(5000);
+    }
+  }
+}
+
+void printLocalTime()
+{
+  if (!getLocalTime(&timeinfo))
+  {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  char timeStringBuff[50]; // 50 chars should be enough
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  // print like "const char*"
+  //  Serial.println(timeStringBuff);
+
+  // Optional: Construct String object
+  //  String asString(timeStringBuff);
+  //  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+  /*
+    Member  Type  Meaning Range
+    tm_sec  int seconds after the minute  0-61*
+    tm_min  int minutes after the hour  0-59
+    tm_hour int hours since midnight  0-23
+    tm_mday int day of the month  1-31
+    tm_mon  int months since January  0-11
+    tm_year int years since 1900
+    tm_wday int days since Sunday 0-6
+    tm_yday int days since January 1  0-365
+    tm_isdst  int Daylight Saving Time flag
+  */
+  // currentTime = String(timeinfo.tm_year + 1900) + "/" + String(timeinfo.tm_mon + 1) + "/" + String(timeinfo.tm_mday) + " " + String(timeinfo.tm_hour) + ":" + String(timeinfo.tm_min) + ":" + String(timeinfo.tm_sec);
+  currentTime = String(timeStringBuff);
+  Serial.println(currentTime);
+}
 
 // draw test on TFT
 void tft_drawtext(int16_t x, int16_t y, String text, uint8_t font_size, uint16_t color)
@@ -103,7 +184,58 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
   return 1;
 }
 
-static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, int face_id)
+static void crop_image(camera_fb_t *dst, camera_fb_t *fb, unsigned short cropLeft, unsigned short cropRight, unsigned short cropTop, unsigned short cropBottom)
+{
+  unsigned int maxTopIndex = cropTop * fb->width * 2;
+  unsigned int minBottomIndex = ((fb->width * fb->height) - (cropBottom * fb->width)) * 2;
+  unsigned short maxX = fb->width - cropRight; // In pixels
+  unsigned short newWidth = fb->width - cropLeft - cropRight;
+  unsigned short newHeight = fb->height - cropTop - cropBottom;
+  size_t newJpgSize = newWidth * newHeight * 2;
+
+  unsigned int writeIndex = 0;
+  // Loop over all bytes
+  for (int i = 0; i < fb->len; i += 2)
+  {
+    // Calculate current X, Y pixel position
+    int x = (i / 2) % fb->width;
+
+    // Crop from the top
+    if (i < maxTopIndex)
+    {
+      continue;
+    }
+
+    // Crop from the bottom
+    if (i > minBottomIndex)
+    {
+      continue;
+    }
+
+    // Crop from the left
+    if (x <= cropLeft)
+    {
+      continue;
+    }
+
+    // Crop from the right
+    if (x > maxX)
+    {
+      continue;
+    }
+
+    // If we get here, keep the pixels
+    dst->buf[writeIndex++] = dst->buf[i];
+    dst->buf[writeIndex++] = dst->buf[i + 1];
+  }
+
+  // Set the new dimensions of the framebuffer for further use.
+  dst->width = newWidth;
+  dst->height = newHeight;
+  dst->len = newJpgSize;
+}
+
+static void draw_face_boxes(camera_fb_t *temp, dl_matrix3du_t *image_matrix, box_array_t *boxes, int face_id)
 {
   int x, y, w, h, i;
   uint32_t color = FACE_COLOR_YELLOW;
@@ -122,6 +254,7 @@ static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, in
   fb.bytes_per_pixel = 3;
   fb.format = FB_BGR888;
   Serial.printf("Boxes: %d\n", boxes->len);
+  unsigned long currentMillis = millis();
   for (i = 0; i < boxes->len; i++)
   {
     // rectangle box
@@ -135,36 +268,54 @@ static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, in
     fb_gfx_drawFastVLine(&fb, x + w - 1, y, h, color);
     // fb_gfx_printf(&fb, (x + (w / 2)), y + (h / 2), FACE_COLOR_GREEN, "%d", counter + 1);
     Serial.printf("Boxes x:%d y:%d w:%d h:%d\n", x, y, w, h);
-    // int divL = h - w + 1;
-    // w = h;
+    int divL = h - w + 1;
+    w = h;
 
-    // unsigned short cropLeft = x - (divL / 2);
-    // unsigned short cropRight = fb.width - x - w + (divL / 2);
-    // unsigned short cropTop = y;
-    // unsigned short cropBottom = fb.height - y - h;
+    unsigned short cropLeft = x - (divL / 2) - 10;
+    unsigned short cropRight = fb.width - x - w + (divL / 2) - 10;
+    unsigned short cropTop = y - 10;
+    unsigned short cropBottom = fb.height - y - h - 10;
 
-    // *cropped = *temp;
-    // crop_image(cropped, temp, cropLeft, cropRight, cropTop, cropBottom);
-    // printf("cropped[%d %d] temp[%d %d]\n", cropped->width, cropped->height, temp->width, temp->height);
-    // uint8_t *jpg_buf = (uint8_t *)malloc(sizeof(uint8_t));
-    // if (jpg_buf == NULL)
-    // {
-    //   printf("Malloc failed to allocate buffer for JPG.\n");
-    // }
-    // else
-    // {
-    //   size_t jpg_size = 0;
+    *cropped = *temp;
+    crop_image(cropped, temp, cropLeft, cropRight, cropTop, cropBottom);
+    printf("cropped[%d %d] temp[%d %d]\n", cropped->width, cropped->height, temp->width, temp->height);
+    uint8_t *jpg_buf = (uint8_t *)malloc(sizeof(uint8_t));
+    if (jpg_buf == NULL)
+    {
+      printf("Malloc failed to allocate buffer for JPG.\n");
+    }
+    else
+    {
+      if (currentMillis - previousMillis >= interval && (cropped->width >= IMAGE_WIDTH || cropped->height>=IMAGE_WIDTH))
+      {
+        size_t jpg_size = 0;
 
-    //   // Convert the RAW image into JPG
-    //   // The parameter "31" is the JPG quality. Higher is better.
-    //   fmt2jpg(cropped->buf, cropped->len, cropped->width, cropped->height, cropped->format, 31, &jpg_buf, &jpg_size);
-    //   String buffer = base64::encode(jpg_buf, jpg_size);
-    //   client.publish("esp32/face", buffer.c_str());
-    //   printf("Converted JPG size: %d bytes \n\n", jpg_size);
-    //   free(jpg_buf);
-    //   jpg_buf = NULL;
-    //   counter++;
-    // }
+        // Convert the RAW image into JPG
+        // The parameter "31" is the JPG quality. Higher is better.
+        fmt2jpg(cropped->buf, cropped->len, cropped->width, cropped->height, cropped->format, 31, &jpg_buf, &jpg_size);
+
+        previousMillis = currentMillis;
+
+        String buffer = base64::encode(jpg_buf, jpg_size);
+        static char json_response[1024 * 3];
+        char *q = json_response;
+        *q++ = '{';
+        q += sprintf(q, "\"data\":\"%s\",", buffer.c_str());
+        q += sprintf(q, "\"ip\":\"%s\",", WiFi.localIP().toString().c_str());
+        q += sprintf(q, "\"waktu\":\"%s\"", currentTime.c_str());
+        *q++ = '}';
+        *q++ = 0;
+        printf("Converted JPG size: %d bytes \n\n", jpg_size);
+        // counter++;
+        // Serial.println(json_response);
+        client.publish("/esp32/face", json_response, strlen(json_response));
+        //   printf("Converted JPG size: %d bytes \n\n", jpg_size);
+        // published = 1;
+        Serial.println(currentTime);
+        free(jpg_buf);
+        jpg_buf = NULL;
+      }
+    }
 
 #if 0
         // landmark
@@ -182,7 +333,7 @@ static inline mtmn_config_t app_mtmn_config()
 {
   mtmn_config_t mtmn_config = {0};
   mtmn_config.type = FAST;
-  mtmn_config.min_face = 60; // 80 default
+  mtmn_config.min_face = 80; // 80 default
   mtmn_config.pyramid = 0.707;
   mtmn_config.pyramid_times = 4;
   mtmn_config.p_threshold.score = 0.6;
@@ -234,21 +385,18 @@ static esp_err_t stream_handler()
     else
     {
 
-      // if (!client.connected())
-      // {
-      //   reconnect();
-      // }
-      // if (!client.loop())
-      // {
-      //   client.connect("ESP32-CAM-Client");
-      // }
+      if (!client.connected())
+      {
+        reconnect();
+      }
+      client.loop();
 
       fr_start = esp_timer_get_time();
       fr_ready = fr_start;
       fr_face = fr_start;
       fr_encode = fr_start;
       fr_recognize = fr_start;
-      Serial.printf("img format:%d w:%d h:%d\n", fb->format, fb->width, fb->height);
+      // Serial.printf("img format:%d w:%d h:%d\n", fb->format, fb->width, fb->height);
       if (fb->width >= 400)
       {
         if (fb->format != PIXFORMAT_JPEG)
@@ -303,7 +451,7 @@ static esp_err_t stream_handler()
                 // digitalWrite(LED_BUILTIN, HIGH);
                 detected = true;
                 fr_recognize = esp_timer_get_time();
-                draw_face_boxes(image_matrix, net_boxes, 1);
+                draw_face_boxes(fb, image_matrix, net_boxes, 1);
                 dl_lib_free(net_boxes->score);
                 dl_lib_free(net_boxes->box);
                 dl_lib_free(net_boxes->landmark);
@@ -338,7 +486,7 @@ static esp_err_t stream_handler()
     }
     if (res == ESP_OK)
     {
-      TJpgDec.drawJpg(0, 6, (const uint8_t *)_jpg_buf, _jpg_buf_len);
+      TJpgDec.drawJpg(0, 0, (const uint8_t *)_jpg_buf, _jpg_buf_len);
     }
     if (fb)
     {
@@ -373,6 +521,22 @@ static esp_err_t stream_handler()
 
   last_frame = 0;
   return res;
+}
+
+void callback(char *topic, byte *payload, unsigned int length)
+{
+  // variable StringPayload untuk menyimpan konten paket data yang diterima
+  String StringPayload = "";
+
+  // Menjadikan setiap character yang diterima menjadi string utuh
+  // melalui proses penggabungan character
+  for (int i = 0; i < length; i++)
+  {
+    StringPayload += (char)payload[i];
+  }
+
+  Serial.println("TOPIC: " + String(topic));
+  Serial.println("PAYLOAD: " + String(StringPayload));
 }
 
 void setup()
@@ -428,6 +592,39 @@ void setup()
     return;
   }
 
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_vflip(s,1);
+
+  for (int i = 0; i < 2; i++)
+  {
+    WiFi.begin(ssid, password); // 執行網路連線
+
+    delay(1000);
+    Serial.println("");
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+
+    long int StartTime = millis();
+    while (WiFi.status() != WL_CONNECTED)
+    {
+      delay(500);
+      if ((StartTime + 5000) < millis())
+        break; // 等待10秒連線
+    }
+  }
+
+  Serial.print("ESP Board MAC Address:  ");
+  MAC = WiFi.macAddress();
+  Serial.println(MAC);
+
+  client.setServer(brokerHost, 1883);
+  client.setBufferSize(1024 * 5);
+  client.setCallback(callback);
+  delay(500);
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  delay(500);
+
   Serial.println("INIT DISPLAY");
   tft.begin();
   tft.setRotation(1); // 0 & 2 Portrait. 1 & 3 landscape
@@ -436,11 +633,12 @@ void setup()
   tft.setFreeFont(FSB9);
   // tft.setCursor(0, 0);
   // tft.println("Hello TFT");
-  sleep(3);
+  sleep(1);
   TJpgDec.setJpgScale(1);
   TJpgDec.setSwapBytes(true);
   TJpgDec.setCallback(tft_output);
-
+  printLocalTime();
+  sleep(1);
   stream_handler();
 }
 
